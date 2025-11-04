@@ -1,0 +1,7 @@
+# Environment and secrets
+.env
+serviceAccountKey.json
+
+# Python virtual environment
+.venv/
+__pycache__/
