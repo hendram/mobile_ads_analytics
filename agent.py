@@ -18,7 +18,7 @@ import re
 from collections import defaultdict
 from google.cloud import firestore
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/mobile_ads_analytics/serviceAccountKey.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/agents/mobile_ads_analytics/serviceAccountKey.json"
 
 logger = logging.getLogger("directions_agent")
 logger.setLevel(logging.INFO)
