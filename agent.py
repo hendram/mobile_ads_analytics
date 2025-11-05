@@ -18,7 +18,6 @@ import re
 from collections import defaultdict
 from google.cloud import firestore
 
-
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/mobile_ads_analytics/serviceAccountKey.json"
 
 logger = logging.getLogger("directions_agent")
@@ -54,7 +53,7 @@ Rules:
    if not exist yet tell user that car never run at all and finish it. 
 7.  Next fed carId and lat/lng as input into firestoretimestampsearch to get timestamp. If there are leading or lagging between 
    eta prediction and timestamp at that location in this structure argument:
-    {id: "carId", lat: "lat", lng: "lng" }
+    {carId: "carId", lat: "lat", lng: "lng" }
     Keep timestamp result for later use, and comparing ETA data with real
    timestamp get from firestoretimestampsearch, if there are leading or lagging tell user how much time by hour, minutes, and
    seconds. 
@@ -228,8 +227,8 @@ class FirestoreEtaSearchAgent(BaseAgent):
 class FirestoreTimestampSearchAgent(BaseAgent):
     name: str = "FirestoreTimestampSearchAgent"
     description: str = (
-        "Search cars_latest_position for newest document per carId, "
-        "then search in subcollection 'positions' for input lat/lng. "
+        "Search cars_position for newest document per carId, "
+        "then search in subcollection 'positions', subdocuments for input lat/lng."
         "Returns carId and timestamp."
     )
 
@@ -240,7 +239,7 @@ class FirestoreTimestampSearchAgent(BaseAgent):
         raw = None
         if hasattr(ctx, "user_content") and ctx.user_content.parts:
             raw = ctx.user_content.parts[0].text
-            print("raw input:", raw)
+            print("raw input:", raw, type(raw))
 
         if not raw:
             yield Event(
@@ -255,9 +254,10 @@ class FirestoreTimestampSearchAgent(BaseAgent):
 
         try:
             payload = json.loads(raw)
-            carId_input = payload.get("carId", "").strip()
-            lat_input = float(payload.get("lat", 0))
-            lng_input = float(payload.get("lng", 0))
+            carId_input = payload.get('carId', "").strip()
+            print("carId_input", carId_input)
+            lat_input = float(payload.get('lat', 0))
+            lng_input = float(payload.get('lng', 0))
             if not carId_input:
                 raise ValueError("carId is required")
         except Exception as e:
@@ -277,6 +277,7 @@ class FirestoreTimestampSearchAgent(BaseAgent):
             latest_timestamp = None
             for doc in db.collection("cars_latest_position").stream():
                 doc_id = doc.id
+                print("doc_id", doc_id)
                 if not doc_id.startswith(f"{carId_input}_"):
                     continue
                 # get timestamp part
@@ -306,10 +307,12 @@ class FirestoreTimestampSearchAgent(BaseAgent):
             match_found = False
             for pos_doc in positions_coll.stream():
                 pos = pos_doc.to_dict() or {}
+                print("pos", pos)
                 lat = pos.get("lat")
                 lng = pos.get("lng")
-                print(f"Checking position: {lat}, {lng}")
-                if lat == lat_input and lng == lng_input:
+                print(f"Checking position: {lat}, {lng}, {lat_input}, {lng_input}")
+                tolerance = 0.00001
+                if abs(lat - lat_input) < tolerance and abs(lng - lng_input) < tolerance:
                     match_found = True
                     yield Event(
                         author=self.name,
