@@ -2,7 +2,6 @@
 import os
 import json
 import logging
-from pydantic import BaseModel
 from google.adk.agents import LlmAgent, BaseAgent
 from google.adk.tools import agent_tool
 from google.adk.events import Event
@@ -17,6 +16,7 @@ import math
 import re
 from collections import defaultdict
 from google.cloud import firestore
+
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/agents/mobile_ads_analytics/serviceAccountKey.json"
 
@@ -33,37 +33,23 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 
 DIRECTIONS_AGENT_INSTRUCTION = """
-You are a geographic assistant. Your task is to convert a human-readable address into latitude and longitude.
+You are a mobile ads analytics assistant. Your task is to get all requried data, calculated based on user input, and present it back to user. 
+Choose rules based on match scenario.
 
 Rules:
-1. Always extract the full address from the user input.
-   - Example: "Please give lat, lng from McDonald's Cipayung Jl. Cipayung Raya, Jakarta 13840 Indonesia"
-     → you must extract: "McDonald's Cipayung Jl. Cipayung Raya, Jakarta 13840 Indonesia"
-2. If the user input is vague or incomplete, ask for a complete address.
-3. Always respond by calling the DirectionsAgent tool with structured argument:
-{
-"destination_address": "<full_address>"
-}
-4. Only call the DirectionsAgent for geocoding (do not attempt analysis or other tasks).
-5. Wait for the agent's response and return the lat/lng to the user if asked, remember this for later use.
-6. Next fed address from user to firestoreetasearch to get data which carId is it and existing ETA in this
-   structure argument:
-    { destination_address: "destination_address from user" }
-   remember this for later use, and return ETA to user if asked 
-   if not exist yet tell user that car never run at all and finish it. 
-7.  Next fed carId and lat/lng as input into firestoretimestampsearch to get timestamp. If there are leading or lagging between 
-   eta prediction and timestamp at that location in this structure argument:
-    {carId: "carId", lat: "lat", lng: "lng" }
-    Keep timestamp result for later use, and comparing ETA data with real
-   timestamp get from firestoretimestampsearch, if there are leading or lagging tell user how much time by hour, minutes, and
-   seconds. 
-   If not exist yet tell user that car still not reach that destination, and finish it. 
-8. And next offering user if they  want to adjust their video on dashboard and on mobile car to match next destination which 
-   will be pass on by car as video viewed must be not sync with current condition as ETA and timestamp on this position already
-   mismatch. 
-9. If yes, then run tools adjustvideo and input hous, minutes, and seconds in format timestamp as expectedTime variable 
-   and send it to http://localhost:3001/adksend with this data structure 
-   { carId, expectedTime } 
+1. Scenario 1: Fuel Cost
+   - If user asks something like "Please calculate all fuel cost for car1 if predictive cost per meters is 1 USD", you must:
+     a. Run the tool `firestoredistanceanalytics` with input in format: carId without spaces (e.g., car1).
+     b. Get all legs returned from Firestore (fields: from, to, distance).
+     c. Calculate fuel cost for each leg using formula: cost = distance * X USD (X is user-provided cost per meter or per km; convert if needed).
+     d. Present a table showing: distance, from, to, fuel cost.
+     e. If JSON is empty, incomplete, or tool failed, respond clearly: "No data received or missing fields".
+
+2. Scenario 2 For example user asked for "Please calculate all professional driver cost for car2 if predictive cost per 10 meters is 1 USD", 
+   then you can run tools firestoredistanceanalytics to get data required by giving input in format:
+   car2 without space at all in between 
+   and get all distance, from and to, then calculate based on each distance by using formula cost = distance/10 * 1 USD, then present back to user
+   as table listing field distance, from, to, professional driver cost.
 """
 
 # -------------------------
@@ -75,143 +61,92 @@ executor = ThreadPoolExecutor(max_workers=2)
 
 import requests, os, json
 
-def geocode_address_sync(address: str):
-    """Call Google Maps Geocoding API synchronously."""
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": address, "key": DIRECTION_API}
-    resp = requests.get(url, params=params, timeout=10)
-    data = resp.json()
-
-    # DEBUG: log the full API response
-    logger.info("Geocoding API response: %s", json.dumps(data, indent=2))
-
-    # ✅ Handle result extraction properly
-    results = data.get("results", [])
-    if not results:
-        return None
-
-    # ✅ Prefer a result that has location_type == "ROOFTOP"
-    best = next((r for r in results if r["geometry"]["location_type"] == "ROOFTOP"), results[0])
-    loc = best["geometry"]["location"]
-    return (loc["lat"], loc["lng"])
-
-# -------------------------
-# Firestore client setup
-# -------------------------
-db = firestore.Client()  # Make sure GOOGLE_APPLICATION_CREDENTIALS is set
-
-class DirectionsAgent(BaseAgent):
-    name: str = "DirectionsAgent"
-    description: str = "Resolves address to lat/lng."
-
-    async def _run_async_impl(self, ctx):
-        # Support dict input
-        address = None
-        if hasattr(ctx, "user_content") and ctx.user_content.parts:
-            address = ctx.user_content.parts[0].text
-        # If user_input is dict, extract destination_address
-      
-        if not address:
-            part = types.Part(text=json.dumps({"error": "No address provided"}))
-            yield Event(author=self.name, content=types.Content(parts=[part]))
-            return
-
-         # Call Google Maps geocoding API in thread
-        loop = asyncio.get_running_loop()
-        lat_lng = await loop.run_in_executor(None, geocode_address_sync, address)
-         
-        if not lat_lng:
-            part = types.Part(text=json.dumps({"error": "Could not geocode address"}))
-            yield Event(author=self.name, content=types.Content(parts=[part]))
-            return
-
-        # Successful result
-        result = {"address": address, "lat_lng": lat_lng}
-        print("result lat lng", result)
-        part = types.Part(text=json.dumps(result))
-        yield Event(author=self.name, content=types.Content(parts=[part]))
-
-
-class FirestoreEtaSearchAgent(BaseAgent):
-    name: str = "FirestoreEtaSearchAgent"
+class FirestoreDistanceAnalyticsAgent(BaseAgent):
+    name: str = "FirestoreDistanceAnalyticsAgent"
     description: str = (
-        "Search <carId>_coll_* collections for ETA where leg 'to' matches destination_address "
-        "in the newest collection per carId. Returns carId and eta."
+        "For the given carId, find the newest collection <carId>_coll_* "
+        "and return all legs with their from, to, and distance."
     )
 
     async def _run_async_impl(self, ctx):
         db = firestore.Client()
 
-        # --- Get input string ---
+        # --- Get input string (carId) ---
         raw = None
         if hasattr(ctx, "user_content") and ctx.user_content.parts:
-            raw = ctx.user_content.parts[0].text
+            raw = ctx.user_content.parts[0].text.strip()
             print("raw input:", raw)
-
+ 
         if not raw:
             yield Event(
                 author=self.name,
                 content=types.Content(parts=[
                     types.Part(text=json.dumps({
-                        "error": "JSON input required: {destination_address}"
+                        "error": "JSON input required: {carId}"
                     }))
                 ])
             )
             return
 
+        carId = raw
         try:
-            # --- Group collections by carId ---
-            car_collections = defaultdict(list)
+            # --- Find all collections that match this carId ---
+            collections = []
             for col in db.collections():
                 cname = col.id
-                print("found collection:", cname)
-                if "_coll_" not in cname:
-                    continue
-                try:
-                    carId, timestamp = cname.split("_coll_", 1)
-                except ValueError:
-                    continue
-                car_collections[carId].append((timestamp, col))
+                if cname.startswith(f"{carId}_coll_"):
+                    try:
+                        _, timestamp = cname.split("_coll_", 1)
+                        collections.append((timestamp, col))
+                    except ValueError:
+                        continue
 
-            # --- Pick newest collection per carId ---
-            newest_collections = {}
-            for carId, cols in car_collections.items():
-                newest_timestamp, newest_col = max(cols, key=lambda x: x[0])
-                newest_collections[carId] = newest_col
-                print(f"carId {carId}, newest collection {newest_col.id}")
+            if not collections:
+                yield Event(
+                    author=self.name,
+                    content=types.Content(parts=[
+                        types.Part(text=json.dumps({
+                            "message": f"No collections found for carId {carId}."
+                        }))
+                    ])
+                )
+                return
 
-            # --- Iterate legs in newest collection and find matching ETA ---
-            for carId, col in newest_collections.items():
-                for leg_doc in col.stream():  # leg_1, leg_2, etc.
-                    leg = leg_doc.to_dict() or {}
-                    print("leg_doc id:", leg_doc.id)
-                    print("leg fields:", leg)
-                    to_field = leg.get("to", "")
-                    print("to_field:", to_field)
-                    if raw in to_field:
-                        eta_event = Event(
-                            author=self.name,
-                            content=types.Content(parts=[
-                                types.Part(text=json.dumps({
-                                    "carId": carId,
-                                    "eta": leg.get("eta")
-                                }))
-                            ])
-                        )
-                        print("Yielding ETA event:", eta_event)
-                        yield eta_event
-                        return  # stop after first match
+            # --- Pick newest collection ---
+            newest_timestamp, newest_col = max(collections, key=lambda x: x[0])
+            print(f"Newest collection for {carId}: {newest_col.id}")
 
-            # --- No match found ---
-            yield Event(
+            # --- Collect all legs ---
+            results = []
+            legs = list(newest_col.stream())
+            print("Total legs found:", len(legs))
+
+            results = []
+            for i, leg_doc in enumerate(legs):
+                leg = leg_doc.to_dict() or {}
+                print(f"Leg #{i+1}:", leg)
+                entry = {
+                    "carId": carId,
+                    "from": leg.get("from", ""),
+                    "to": leg.get("to", ""),
+                    "distance": leg.get("distance", 0)
+                }
+                results.append(entry)
+            print(f"After append #{i+1}: total results = {len(results)}")
+
+            print("Total results collected:", len(results))
+            # --- Return all legs ---
+            event = Event(
                 author=self.name,
                 content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "message": "No matching ETA found for given destination_address."
-                    }))
+                    types.Part(text=json.dumps(results, indent=2))
                 ])
             )
 
+            print("event", event)
+            yield event
+
+            
         except Exception as e:
             yield Event(
                 author=self.name,
@@ -221,7 +156,6 @@ class FirestoreEtaSearchAgent(BaseAgent):
                     }))
                 ])
             )
-
 
 
 class FirestoreTimestampSearchAgent(BaseAgent):
@@ -348,9 +282,7 @@ class FirestoreTimestampSearchAgent(BaseAgent):
 # -------------------------
 # Wrap BaseAgents as tools
 # -------------------------
-directions_tool = agent_tool.AgentTool(agent=DirectionsAgent())
-firestoreetasearch_tool = agent_tool.AgentTool(agent=FirestoreEtaSearchAgent())
-firestoretimestampsearch_tool = agent_tool.AgentTool(agent=FirestoreTimestampSearchAgent())
+firestoredistanceanalytics_tool = agent_tool.AgentTool(agent=FirestoreDistanceAnalyticsAgent())
 
 # -------------------------
 # LLM Agent: Semantic Processor
@@ -359,7 +291,7 @@ semantic_agent = LlmAgent(
     name="SemanticAgent",
     model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
     instruction=DIRECTIONS_AGENT_INSTRUCTION,
-    tools=[directions_tool, firestoreetasearch_tool, firestoretimestampsearch_tool]
+    tools=[firestoredistanceanalytics_tool],
 )
 
 
