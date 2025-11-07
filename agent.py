@@ -53,7 +53,12 @@ Rules:
      table distance, from, to, cost and calculate different total cost between car 1 and car 2, which one more expensive for total route 
      then you can run tools combined_sequential_agent and  another_seq_agent to input car 1 and car 2 as 2 different json format:
      make it like json { id: carId, userquery: user asked }  and input it to combined_sequential_agent,
-           { id: carId, userquery: user asked } input it to another_seq_agent which each id different car id 
+           { id: carId, userquery: user asked } input it to another_seq_agent which each id different car id
+
+4. Scenario 4: Counting how many trip specific car has drove in
+     - If user ask like "please give me how many trip this car has drive in ", then you can run tool 
+       firestorecalculatedtripcar by giving input in format:
+       carId without spaces (e.g., car1)
 
 """
 
@@ -179,12 +184,78 @@ Predictivecost_agent2 = LlmAgent(
     )
 )
 
+class FirestoreCalculatedTripCarAgent(BaseAgent):
+    name: str = "FirestoreCalculatedTripCarAgent"
+    description: str = (
+        "For the given carId, count how many collections <carId>_coll_* exist "
+        "to see how many times the car drove that route."
+    )
+   
+    async def _run_async_impl(self, ctx):
+        db = firestore.Client()
+
+        # --- Get input string (carId) ---
+        raw = None
+        if hasattr(ctx, "user_content") and ctx.user_content.parts:
+            raw = ctx.user_content.parts[0].text.strip()
+            print("raw input:", raw)
+ 
+        if not raw:
+            yield Event(
+                author=self.name,
+                content=types.Content(parts=[
+                    types.Part(text=json.dumps({
+                        "error": "JSON input required: {carId}"
+                    }))
+                ])
+            )
+            return
+        
+        try:
+            raw_json = json.loads(raw)  # parse string into dict
+            carId = raw_json.get("id")
+            if not carId:
+                yield Event(
+                    author=self.name,
+                    content=types.Content(parts=[
+                        types.Part(text=json.dumps({
+                            "error": "Missing 'id' in input JSON."
+                        }))
+                    ])
+                )
+                return
+
+            # --- Find all collections that match this carId ---
+            num_drives = sum(1 for col in db.collections() if col.id.startswith(f"{carId}_coll_"))
+
+            # --- Prepare and yield response ---
+            response = {
+                "carId": carId,
+                "num_drives": num_drives
+            }
+
+
+            # --- Store in session ---
+            ctx.session.state[f"temp:num_drives"] = response
+
+        except Exception as e:
+            yield Event(
+                author=self.name,
+                content=types.Content(parts=[
+                    types.Part(text=json.dumps({
+                        "error": f"Firestore error: {str(e)}"
+                    }))
+                ])
+            )
+
+
 # -------------------------
 # Wrap BaseAgents as tools
 # -------------------------
 Predictivecost_agent_tool = agent_tool.AgentTool(agent=Predictivecost_agent)
 Predictivecost_agent2_tool = agent_tool.AgentTool(agent=Predictivecost_agent2)
 firestoredistanceanalytics_tool = agent_tool.AgentTool(agent=FirestoreDistanceAnalyticsAgent())
+firestorecalculatedtripcar_tool = agent_tool.AgentTool(agent=FirestoreCalculatedTripCarAgent())
 
 another_seq_agent = SequentialAgent(
     name="anotherSequentialAgent",
@@ -218,7 +289,7 @@ semantic_agent = LlmAgent(
     name="SemanticAgent",
     model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
     instruction=DIRECTIONS_AGENT_INSTRUCTION,
-    tools=[combined_sequential_agent_tool, another_seq_agent_tool]   # ✅ must be a tool, not an agent
+    tools=[combined_sequential_agent_tool, another_seq_agent_tool, firestorecalculatedtripcar]   # ✅ must be a tool, not an agent
 )
 
 original_semantic_run = semantic_agent._run_async_impl
