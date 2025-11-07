@@ -2,7 +2,7 @@
 import os
 import json
 import logging
-from google.adk.agents import LlmAgent, BaseAgent
+from google.adk.agents import LlmAgent, BaseAgent, SequentialAgent, ParallelAgent
 from google.adk.tools import agent_tool
 from google.adk.events import Event
 from google.genai import types
@@ -39,17 +39,22 @@ Choose rules based on match scenario.
 Rules:
 1. Scenario 1: Fuel Cost
    - If user asks something like "Please calculate all fuel cost for car1 if predictive cost per meters is 1 USD", you must:
-     a. Run the tool `firestoredistanceanalytics` with input in format: carId without spaces (e.g., car1).
-     b. Get all legs returned from Firestore (fields: from, to, distance).
-     c. Calculate fuel cost for each leg using formula: cost = distance * X USD (X is user-provided cost per meter or per km; convert if needed).
-     d. Present a table showing: distance, from, to, fuel cost.
-     e. If JSON is empty, incomplete, or tool failed, respond clearly: "No data received or missing fields".
+     a. Run the tool combined_sequential_agent with input in format: carId without spaces (e.g., car1) and user ask, so make 
+        it like json { id: carId, userquery: user asked }
 
-2. Scenario 2 For example user asked for "Please calculate all professional driver cost for car2 if predictive cost per 10 meters is 1 USD", 
-   then you can run tools firestoredistanceanalytics to get data required by giving input in format:
-   car2 without space at all in between 
-   and get all distance, from and to, then calculate based on each distance by using formula cost = distance/10 * 1 USD, then present back to user
-   as table listing field distance, from, to, professional driver cost.
+2. Scenario 2: Driver Cost
+   - For example user asked for "Please calculate all professional driver cost for car2 if predictive cost per 10 meters is 1 USD", 
+   then you can run tools combined_sequential_agent to get data required by giving input in format:
+   carId without spaces (e.g., car1) and user ask, so make it like json { id: carId, userquery: user asks }.
+
+3. Scenario 3: Comparing total cost of fuel or driver between 2 car
+   - If user ask something like "please calculate total cost of fuel if per 1000 meters will cost 2usd for car 2 and return all waypoint too with table distance, from, to, cost  and 
+     comparing with car 1 if cost of fuel for car 1 per 2000 meters will cost 3 usd and make table too with 
+     table distance, from, to, cost and calculate different total cost between car 1 and car 2, which one more expensive for total route 
+     then you can run tools combined_sequential_agent and  another_seq_agent to input car 1 and car 2 as 2 different json format:
+     make it like json { id: carId, userquery: user asked }  and input it to combined_sequential_agent,
+           { id: carId, userquery: user asked } input it to another_seq_agent which each id different car id 
+
 """
 
 # -------------------------
@@ -67,7 +72,7 @@ class FirestoreDistanceAnalyticsAgent(BaseAgent):
         "For the given carId, find the newest collection <carId>_coll_* "
         "and return all legs with their from, to, and distance."
     )
-
+   
     async def _run_async_impl(self, ctx):
         db = firestore.Client()
 
@@ -87,8 +92,11 @@ class FirestoreDistanceAnalyticsAgent(BaseAgent):
                 ])
             )
             return
-
-        carId = raw
+        
+        raw_json = json.loads(raw)  # parse string into dict
+        carId = raw_json.get("id")
+        user_query = raw_json.get("userquery")
+        ctx.session.state["temp:user_query"] = user_query        
         try:
             # --- Find all collections that match this carId ---
             collections = []
@@ -136,17 +144,9 @@ class FirestoreDistanceAnalyticsAgent(BaseAgent):
 
             print("Total results collected:", len(results))
             # --- Return all legs ---
-            event = Event(
-                author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps(results, indent=2))
-                ])
-            )
-
-            print("event", event)
-            yield event
-
-            
+            ctx.session.state["temp:legs"] = results        
+            print("SemanticAgent sees temp:legs:", ctx.session.state.get("temp:legs"), ctx.session.state.get("temp:user_query"))
+     
         except Exception as e:
             yield Event(
                 author=self.name,
@@ -157,142 +157,117 @@ class FirestoreDistanceAnalyticsAgent(BaseAgent):
                 ])
             )
 
-
-class FirestoreTimestampSearchAgent(BaseAgent):
-    name: str = "FirestoreTimestampSearchAgent"
-    description: str = (
-        "Search cars_position for newest document per carId, "
-        "then search in subcollection 'positions', subdocuments for input lat/lng."
-        "Returns carId and timestamp."
+Predictivecost_agent = LlmAgent(
+    name="PredictivecostAgent",
+    model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
+    instruction=(
+      """    Your job is to get user query from {temp:user_query} and calculate all requested with this data {temp:legs}.
+        If {temp:legs} is empty or missing, say so clearly.
+        Output only the data in JSON or text form, nothing else.
+      """ 
     )
+)
 
-    async def _run_async_impl(self, ctx):
-        db = firestore.Client()
-
-        # --- Parse JSON input ---
-        raw = None
-        if hasattr(ctx, "user_content") and ctx.user_content.parts:
-            raw = ctx.user_content.parts[0].text
-            print("raw input:", raw, type(raw))
-
-        if not raw:
-            yield Event(
-                author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "error": "JSON input required: {carId, lat, lng}"
-                    }))
-                ])
-            )
-            return
-
-        try:
-            payload = json.loads(raw)
-            carId_input = payload.get('carId', "").strip()
-            print("carId_input", carId_input)
-            lat_input = float(payload.get('lat', 0))
-            lng_input = float(payload.get('lng', 0))
-            if not carId_input:
-                raise ValueError("carId is required")
-        except Exception as e:
-            yield Event(
-                author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "error": f"Invalid JSON or missing fields: {str(e)}"
-                    }))
-                ])
-            )
-            return
-
-        try:
-            # --- Find all docs with prefix carId_ in cars_latest_position ---
-            latest_doc = None
-            latest_timestamp = None
-            for doc in db.collection("cars_latest_position").stream():
-                doc_id = doc.id
-                print("doc_id", doc_id)
-                if not doc_id.startswith(f"{carId_input}_"):
-                    continue
-                # get timestamp part
-                try:
-                    _, timestamp_str = doc_id.split("_", 1)
-                except ValueError:
-                    continue
-                if latest_timestamp is None or timestamp_str > latest_timestamp:
-                    latest_timestamp = timestamp_str
-                    latest_doc = doc
-
-            if not latest_doc:
-                yield Event(
-                    author=self.name,
-                    content=types.Content(parts=[
-                        types.Part(text=json.dumps({
-                            "message": f"No documents found for carId {carId_input}"
-                        }))
-                    ])
-                )
-                return
-
-            print(f"Newest doc for {carId_input}: {latest_doc.id}")
-
-            # --- Search positions subcollection ---
-            positions_coll = latest_doc.reference.collection("positions")
-            match_found = False
-            for pos_doc in positions_coll.stream():
-                pos = pos_doc.to_dict() or {}
-                print("pos", pos)
-                lat = pos.get("lat")
-                lng = pos.get("lng")
-                print(f"Checking position: {lat}, {lng}, {lat_input}, {lng_input}")
-                tolerance = 0.00001
-                if abs(lat - lat_input) < tolerance and abs(lng - lng_input) < tolerance:
-                    match_found = True
-                    yield Event(
-                        author=self.name,
-                        content=types.Content(parts=[
-                            types.Part(text=json.dumps({
-                                "carId": carId_input,
-                                "timestamp": latest_timestamp
-                            }))
-                        ])
-                    )
-                    break
-
-            if not match_found:
-                yield Event(
-                    author=self.name,
-                    content=types.Content(parts=[
-                        types.Part(text=json.dumps({
-                            "message": f"No matching position found for carId {carId_input} at given lat/lng"
-                        }))
-                    ])
-                )
-
-        except Exception as e:
-            yield Event(
-                author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "error": f"Firestore error: {str(e)}"
-                    }))
-                ])
-            )
+Predictivecost_agent2 = LlmAgent(
+    name="PredictivecostAgent",
+    model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
+    instruction=(
+      """    Your job is to get user query from {temp:user_query} and calculate all requested with this data {temp:legs}.
+        If {temp:legs} is empty or missing, say so clearly.
+        Output only the data in JSON or text form, nothing else.
+      """ 
+    )
+)
 
 # -------------------------
 # Wrap BaseAgents as tools
 # -------------------------
+Predictivecost_agent_tool = agent_tool.AgentTool(agent=Predictivecost_agent)
+Predictivecost_agent2_tool = agent_tool.AgentTool(agent=Predictivecost_agent2)
 firestoredistanceanalytics_tool = agent_tool.AgentTool(agent=FirestoreDistanceAnalyticsAgent())
+
+another_seq_agent = SequentialAgent(
+    name="anotherSequentialAgent",
+    sub_agents=[FirestoreDistanceAnalyticsAgent(), Predictivecost_agent2],
+    description="Run Firestore fetch first, then process with TestFetch agent using the same session temp."
+)
+
+
+combined_sequential_agent = SequentialAgent(
+    name="combinedSequentialAgent",
+    sub_agents=[FirestoreDistanceAnalyticsAgent(), Predictivecost_agent],
+    description="Run Firestore fetch first, then process with TestFetch agent using the same session temp."
+)
+
+
+combined_sequential_agent_tool = agent_tool.AgentTool(agent=combined_sequential_agent)
+another_seq_agent_tool = agent_tool.AgentTool(agent=another_seq_agent)
+
+
+
 
 # -------------------------
 # LLM Agent: Semantic Processor
 # -------------------------
+# Wrap it as a tool for LlmAgent
+
+
+
+# Semantic LLM agent uses the sequential agent tool
 semantic_agent = LlmAgent(
     name="SemanticAgent",
     model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
     instruction=DIRECTIONS_AGENT_INSTRUCTION,
-    tools=[firestoredistanceanalytics_tool],
+    tools=[combined_sequential_agent_tool, another_seq_agent_tool]   # ✅ must be a tool, not an agent
 )
+
+original_semantic_run = semantic_agent._run_async_impl
+
+async def debug_semantic_run(ctx):
+    print("\n=== SemanticAgent DEBUG ===")
+    print("Input context passed from RootAgent:")
+    print(ctx)
+
+    # This preserves async generator behavior expected by ADK
+    async for event in original_semantic_run(ctx):
+        # --- Inspect raw event ---
+        print("Event:", event)
+
+        # --- If event contains LLM response, inspect it ---
+        llm_response = getattr(event, "llm_response", None)
+        if llm_response:
+            for i, candidate in enumerate(llm_response.candidates):
+                for j, part in enumerate(candidate.content.parts):
+                    part_type = getattr(part, "type", "<unknown>")
+                    part_text = getattr(part, "text", "")
+                    part_metadata = getattr(part, "metadata", None)
+                    print(f"[Candidate {i} Part {j}] Type: {part_type}")
+                    print(f"Text: {part_text}")
+                    print(f"Metadata: {part_metadata}")
+
+            # Concatenate output_text parts
+            llm_text = ""
+            for candidate in llm_response.candidates:
+                for part in candidate.content.parts:
+                    if getattr(part, "type", "") == "output_text" and getattr(part, "text", ""):
+                        llm_text += part.text
+
+            print("\n=== Concatenated output_text ===")
+            print(llm_text)
+
+            # Try parsing as JSON
+            try:
+                parsed_json = json.loads(llm_text)
+                print("\n✅ Parsed JSON from SemanticAgent output:")
+                print(json.dumps(parsed_json, indent=2))
+            except json.JSONDecodeError:
+                print("\n⚠️ Could not parse as JSON. Raw text returned instead.")
+
+        # Yield the event to preserve async generator interface
+        yield event
+
+# Patch the agent
+semantic_agent._run_async_impl = debug_semantic_run
 
 
 # -------------------------
@@ -307,3 +282,4 @@ root_agent = LlmAgent(
     ),
     tools=[agent_tool.AgentTool(agent=semantic_agent)]
 )
+
