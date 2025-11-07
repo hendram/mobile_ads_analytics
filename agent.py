@@ -16,7 +16,7 @@ import math
 import re
 from collections import defaultdict
 from google.cloud import firestore
-
+from datetime import datetime
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/agents/mobile_ads_analytics/serviceAccountKey.json"
 
@@ -57,9 +57,13 @@ Rules:
 
 4. Scenario 4: Counting how many trip specific car has drove in
      - If user ask like "please give me how many trip this car has drive in ", then you can run tool 
-       firestorecalculatedtripcar by giving input in format:
-       carId without spaces (e.g., car1)
+       calculated_trip_carseq by giving input in format:
+       carId without spaces (e.g., car1), make it like json { id: carId }
 
+5. Scenario 5: Counting how much elapse time has been since first car drove till last position
+     - If user ask like "Please get me elapse time for car1 latest trip", then you can run tools calculated_elapse_timeseq
+       to get data by giving input in format:
+       carId without spaces (e.g., car1), make it like json { id: carId }
 """
 
 # -------------------------
@@ -198,7 +202,7 @@ class FirestoreCalculatedTripCarAgent(BaseAgent):
         raw = None
         if hasattr(ctx, "user_content") and ctx.user_content.parts:
             raw = ctx.user_content.parts[0].text.strip()
-            print("raw input:", raw)
+            print("raw input calc trip:", raw)
  
         if not raw:
             yield Event(
@@ -212,8 +216,10 @@ class FirestoreCalculatedTripCarAgent(BaseAgent):
             return
         
         try:
-            raw_json = json.loads(raw)  # parse string into dict
+            raw_json = json.loads(raw)
+            print("raw_json", raw_json)
             carId = raw_json.get("id")
+            print("carId", carId)
             if not carId:
                 yield Event(
                     author=self.name,
@@ -227,14 +233,14 @@ class FirestoreCalculatedTripCarAgent(BaseAgent):
 
             # --- Find all collections that match this carId ---
             num_drives = sum(1 for col in db.collections() if col.id.startswith(f"{carId}_coll_"))
-
+            print("num_drives", num_drives)
             # --- Prepare and yield response ---
             response = {
                 "carId": carId,
                 "num_drives": num_drives
             }
 
-
+            print("response", response)
             # --- Store in session ---
             ctx.session.state[f"temp:num_drives"] = response
 
@@ -248,6 +254,163 @@ class FirestoreCalculatedTripCarAgent(BaseAgent):
                 ])
             )
 
+CalculatedTripCarReport_agent = LlmAgent(
+    name="CalculatedTripCarReportAgent",
+    model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
+    instruction=(
+      """    Your job is to give return data from {temp:num_drives} .
+        If {temp:num_drives} is empty or missing, say so clearly.
+        Output only the data in JSON or text form, nothing else.
+      """ 
+    )
+)
+
+def parse_firestore_ts(ts_str: str) -> datetime:
+    """
+    Parse Firestore timestamp into a consistent, timezone-naive datetime.
+    Supports both ISO and compact formats.
+    """
+    print(f"[DEBUG] Parsing timestamp: {ts_str}")
+
+    # --- ISO style: 2025-11-06T11:01:05.336Z ---
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z", ts_str):
+        ts_norm = ts_str.replace("Z", "")
+        dt = datetime.fromisoformat(ts_norm)
+        print(f"[DEBUG] Parsed ISO: {dt.isoformat()}")
+        return dt
+
+    # --- Compact Firestore style: 2025-11-06T110100416Z ---
+    m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})T(\d{2})(\d{2})(\d{2})(\d+)Z?", ts_str)
+    if m:
+        date, hh, mm, ss, fsec = m.groups()
+        fsec = fsec[:6].ljust(6, "0")  # normalize microseconds
+        ts_norm = f"{date}T{hh}:{mm}:{ss}.{fsec}"
+        dt = datetime.fromisoformat(ts_norm)
+        print(f"[DEBUG] Parsed compact: {dt.isoformat()}")
+        return dt
+
+    raise ValueError(f"Invalid Firestore timestamp format: {ts_str}")
+
+
+class FirestoreElapsedTimeAgent(BaseAgent):
+    name: str = "FirestoreElapsedTimeAgent"
+    description: str = (
+        "For a given carId, calculate how many hours, minutes, and seconds "
+        "have elapsed since the first drive until the latest drive."
+    )
+
+    async def _run_async_impl(self, ctx):
+        db = firestore.Client()
+
+        # --- Parse JSON input ---
+        raw = None
+        if hasattr(ctx, "user_content") and ctx.user_content.parts:
+            raw = ctx.user_content.parts[0].text
+            print("raw input elapse:", raw)
+
+        if not raw:
+             yield Event(
+                 author=self.name,
+                 content=types.Content(parts=[
+                 types.Part(text=json.dumps({"error": "JSON input required: {carId}"}))
+                 ])
+             )
+             return
+
+        try:
+            payload = json.loads(raw)
+            carId_input = payload.get("id", "").strip()
+            print("carId_input", carId_input)
+            if not carId_input:
+                raise ValueError("carId is required")
+        except Exception as e:
+            ctx.session.state["temp:elapsed_time"] = {
+                "error": f"Invalid JSON or missing fields: {str(e)}"
+            }
+            return
+
+        try:
+            # --- Find all docs with prefix carId_ in cars_latest_position ---
+            all_docs = []
+            for doc in db.collection("cars_latest_position").stream():
+                doc_id = doc.id
+                print("docid", doc_id)
+                if doc_id.startswith(f"{carId_input}_"):
+                    try:
+                        _, timestamp_str = doc_id.split("_", 1)
+                        all_docs.append((timestamp_str, doc))
+                    except ValueError:
+                        continue
+
+            if not all_docs:
+                ctx.session.state["temp:elapsed_time"] = {
+                    "error": f"No documents found for carId {carId_input}"
+                }
+                return
+
+            all_docs.sort(key=lambda x: x[0])
+            latest_timestamp_str, latest_doc = all_docs[-1] 
+
+            latest_dt = parse_firestore_ts(latest_timestamp_str)
+            print("latest_dt", latest_dt)
+            # --- Search positions subcollection for latest doc ---
+            positions_coll = latest_doc.reference.collection("positions")
+            docs = list(positions_coll.stream())
+            print(f"positions_coll has {len(docs)} documents")
+            print("positions_coll", positions_coll)
+            latest_position_ts = None
+            for pos_doc in positions_coll.stream():
+                print("pos_doc", pos_doc)
+                pos = pos_doc.to_dict() or {}
+                print("pos", pos)
+                ts_str = pos.get("timestamp")  # assuming position has 'timestamp' field
+                print("ts_str", ts_str)
+                if ts_str:
+                    pos_dt = parse_firestore_ts(ts_str)
+                    print("posdt", pos_dt)
+                    if not latest_position_ts or pos_dt > latest_position_ts:
+                        latest_position_ts = pos_dt
+                        print("latest_position_ts", latest_position_ts)
+            if not latest_position_ts:
+                # fallback to latest_doc timestamp if no positions timestamps found
+                latest_position_ts = latest_dt
+
+            # --- Calculate elapsed time ---
+            elapsed = latest_position_ts - latest_dt
+            print("elapse", elapsed)
+            hours, remainder = divmod(elapsed.total_seconds(), 3600)
+            minutes, seconds = divmod(remainder, 60)
+
+            # --- Store in session ---
+            ctx.session.state["temp:elapsed_time"] = {
+                "carId": carId_input,
+                "elapsed_time": {
+                    "hours": int(hours),
+                    "minutes": int(minutes),
+                    "seconds": int(seconds)
+                }
+            }
+
+        except Exception as e:
+            ctx.session.state["temp:elapsed_time"] = {
+                "error": f"Firestore error: {str(e)}"
+            }
+            return
+
+
+CalculatedElapseTimeReport_agent = LlmAgent(
+    name="CalculatedElapseTimeReportAgent",
+    model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
+    instruction=(
+      """    Your job is to give return data from {temp:elapsed_time} .
+        If {temp:elapsed_time} is empty or missing, say so clearly.
+        Output only the data in JSON or text form, nothing else.
+      """ 
+    )
+)
+
+
+
 
 # -------------------------
 # Wrap BaseAgents as tools
@@ -256,6 +419,9 @@ Predictivecost_agent_tool = agent_tool.AgentTool(agent=Predictivecost_agent)
 Predictivecost_agent2_tool = agent_tool.AgentTool(agent=Predictivecost_agent2)
 firestoredistanceanalytics_tool = agent_tool.AgentTool(agent=FirestoreDistanceAnalyticsAgent())
 firestorecalculatedtripcar_tool = agent_tool.AgentTool(agent=FirestoreCalculatedTripCarAgent())
+calculatedtripcarreport_tool = agent_tool.AgentTool(agent=CalculatedTripCarReport_agent)
+firestoreelapsedtime_tool = agent_tool.AgentTool(agent=FirestoreElapsedTimeAgent())
+calculatedelapsetime_tool = agent_tool.AgentTool(agent=CalculatedElapseTimeReport_agent)
 
 another_seq_agent = SequentialAgent(
     name="anotherSequentialAgent",
@@ -270,75 +436,31 @@ combined_sequential_agent = SequentialAgent(
     description="Run Firestore fetch first, then process with TestFetch agent using the same session temp."
 )
 
+calculatedtripcarseq_agent = SequentialAgent(
+    name="calculatedtripcarSequentialAgent",
+    sub_agents=[FirestoreCalculatedTripCarAgent(), CalculatedTripCarReport_agent],
+    description="Run FirestoreCalculatedTripCar first, then process with CalculatedTripCarReport agent using the same session temp."
+)
+
+calculatedtripelapsetimeseq_agent = SequentialAgent(
+    name="calculatedtripelapsetimeSequentialAgent",
+    sub_agents=[FirestoreElapsedTimeAgent(), CalculatedElapseTimeReport_agent],
+    description="Run FirestoreElapseTime first, then process with CalculatedElapseTimeReport agent using the same session temp."
+)
+
 
 combined_sequential_agent_tool = agent_tool.AgentTool(agent=combined_sequential_agent)
 another_seq_agent_tool = agent_tool.AgentTool(agent=another_seq_agent)
-
-
-
-
-# -------------------------
-# LLM Agent: Semantic Processor
-# -------------------------
-# Wrap it as a tool for LlmAgent
-
-
+calculated_trip_carseq_tool = agent_tool.AgentTool(agent=calculatedtripcarseq_agent)
+calculated_elapse_timeseq_tool = agent_tool.AgentTool(agent=calculatedtripelapsetimeseq_agent)
 
 # Semantic LLM agent uses the sequential agent tool
 semantic_agent = LlmAgent(
     name="SemanticAgent",
     model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
     instruction=DIRECTIONS_AGENT_INSTRUCTION,
-    tools=[combined_sequential_agent_tool, another_seq_agent_tool, firestorecalculatedtripcar]   # ✅ must be a tool, not an agent
+    tools=[combined_sequential_agent_tool, another_seq_agent_tool, calculated_trip_carseq_tool, calculated_elapse_timeseq_tool]   
 )
-
-original_semantic_run = semantic_agent._run_async_impl
-
-async def debug_semantic_run(ctx):
-    print("\n=== SemanticAgent DEBUG ===")
-    print("Input context passed from RootAgent:")
-    print(ctx)
-
-    # This preserves async generator behavior expected by ADK
-    async for event in original_semantic_run(ctx):
-        # --- Inspect raw event ---
-        print("Event:", event)
-
-        # --- If event contains LLM response, inspect it ---
-        llm_response = getattr(event, "llm_response", None)
-        if llm_response:
-            for i, candidate in enumerate(llm_response.candidates):
-                for j, part in enumerate(candidate.content.parts):
-                    part_type = getattr(part, "type", "<unknown>")
-                    part_text = getattr(part, "text", "")
-                    part_metadata = getattr(part, "metadata", None)
-                    print(f"[Candidate {i} Part {j}] Type: {part_type}")
-                    print(f"Text: {part_text}")
-                    print(f"Metadata: {part_metadata}")
-
-            # Concatenate output_text parts
-            llm_text = ""
-            for candidate in llm_response.candidates:
-                for part in candidate.content.parts:
-                    if getattr(part, "type", "") == "output_text" and getattr(part, "text", ""):
-                        llm_text += part.text
-
-            print("\n=== Concatenated output_text ===")
-            print(llm_text)
-
-            # Try parsing as JSON
-            try:
-                parsed_json = json.loads(llm_text)
-                print("\n✅ Parsed JSON from SemanticAgent output:")
-                print(json.dumps(parsed_json, indent=2))
-            except json.JSONDecodeError:
-                print("\n⚠️ Could not parse as JSON. Raw text returned instead.")
-
-        # Yield the event to preserve async generator interface
-        yield event
-
-# Patch the agent
-semantic_agent._run_async_impl = debug_semantic_run
 
 
 # -------------------------
