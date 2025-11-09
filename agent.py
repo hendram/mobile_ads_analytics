@@ -48,8 +48,10 @@ Rules:
      comparing with car 1 if cost of fuel for car 1 per 2000 meters will cost 3 usd and make table too with 
      table distance, from, to, cost and calculate different total cost between car 1 and car 2, which one more expensive for total route 
      then you can run tools combined_sequential_agent and  another_seq_agent to input car 1 and car 2 as 2 different json format:
-     make it like json { id: carId, userquery: user asked }  and input it to combined_sequential_agent,
-           { id: carId, userquery: user asked } input it to another_seq_agent which each id different car id
+     and intelligently divide user asked for combined_sequential_agent and another_seq_agent based on carId 
+     wants to calculate and    
+    make it like json { id: carId, userquery: user asked match with carId}  and input it to combined_sequential_agent,
+           { id: carId, userquery: user asked match with carId } input it to another_seq_agent which each id different car id and different user asked
 
 4. Scenario 4: Counting how many trip specific car has drove in
      - If user ask like "please give me how many trip this car has drive in ", then you can run tool 
@@ -151,8 +153,8 @@ class FirestoreDistanceAnalyticsAgent(BaseAgent):
                 ])
             )
 
-class FirestoreDistanceAnalyticsAgent2(BaseAgent):
-    name: str = "FirestoreDistanceAnalyticsAgent"
+class FirestoreDistanceAnalytics2Agent(BaseAgent):
+    name: str = "FirestoreDistanceAnalytics2Agent"
     description: str = (
         "For the given carId, find the newest collection <carId>_coll_* "
         "and return all legs with their from, to, and distance."
