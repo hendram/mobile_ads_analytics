@@ -47,11 +47,12 @@ Rules:
    - If user ask something like "please calculate total cost of fuel if per 1000 meters will cost 2usd for car 2 and return all waypoint too with table distance, from, to, cost  and 
      comparing with car 1 if cost of fuel for car 1 per 2000 meters will cost 3 usd and make table too with 
      table distance, from, to, cost and calculate different total cost between car 1 and car 2, which one more expensive for total route 
-     then you can run tools combined_sequential_agent and  another_seq_agent to input car 1 and car 2 as 2 different json format:
-     and intelligently divide user asked for combined_sequential_agent and another_seq_agent based on carId 
-     wants to calculate and    
+     then you can run tools combined_sequential_agent and run it combined_sequential_agent again for another car 
+     and intelligently divide user asked for combined_sequential_agent and second call combined_sequential_agent
+     based on carId  and    
     make it like json { id: carId, userquery: user asked match with carId}  and input it to combined_sequential_agent,
-           { id: carId, userquery: user asked match with carId } input it to another_seq_agent which each id different car id and different user asked
+           { id: carId, userquery: user asked match with carId } input it again to combined_sequential_agent 
+    which each id different car id and different user asked
 
 4. Scenario 4: Counting how many trip specific car has drove in
      - If user ask like "please give me how many trip this car has drive in ", then you can run tool 
@@ -62,9 +63,19 @@ Rules:
      - If user ask like "Please get me elapse time for car1 latest trip", then you can run tools calculated_elapse_timeseq
        to get data by giving input in format:
        carId without spaces (e.g., car1), make it like json { id: carId }
-"""
 
-# -------------------------
+6.Scenario 6: If user for example give this query: "calculate total fuel cost for car 1 latest trip along with all legs  if fuel price for 
+ car 1 is 3 USD for every 1500 m and report as graph points location consist of x and y"  then always send to 
+ tool combined_sequential_agent with input in format: carId without spaces (e.g., car1) and user ask which 
+ added more clearer instruction like in format like [{x: 3434, y: 299}, { } ...]  but not cumulative, except user asked
+  without other words attached to for every leg 
+ and always return this [{x: 3434, y: 299}, { } ...] in markdown suitable for plotly so make
+        it like json { id: carId, userquery: user asked plus your additional instruction} 
+
+
+""" 
+
+# ------------------------- 
 # BaseAgents (specialized agents)
 # -------------------------
 DIRECTION_API = os.getenv("DIRECTION_API")
@@ -153,86 +164,6 @@ class FirestoreDistanceAnalyticsAgent(BaseAgent):
                 ])
             )
 
-class FirestoreDistanceAnalytics2Agent(BaseAgent):
-    name: str = "FirestoreDistanceAnalytics2Agent"
-    description: str = (
-        "For the given carId, find the newest collection <carId>_coll_* "
-        "and return all legs with their from, to, and distance."
-    )
-   
-    async def _run_async_impl(self, ctx):
-        db = firestore.Client()
-
-        raw = None
-        if hasattr(ctx, "user_content") and ctx.user_content.parts:
-            raw = ctx.user_content.parts[0].text.strip()
- 
-        if not raw:
-            yield Event(
-                author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "error": "JSON input required: {carId}"
-                    }))
-                ])
-            )
-            return
-        
-        raw_json = json.loads(raw)  
-        carId = raw_json.get("id")
-        user_query = raw_json.get("userquery")
-        ctx.session.state["temp:user_query2"] = user_query        
-        try:
-            collections = []
-            for col in db.collections():
-                cname = col.id
-                if cname.startswith(f"{carId}_coll_"):
-                    try:
-                        _, timestamp = cname.split("_coll_", 1)
-                        collections.append((timestamp, col))
-                    except ValueError:
-                        continue
-
-            if not collections:
-                yield Event(
-                    author=self.name,
-                    content=types.Content(parts=[
-                        types.Part(text=json.dumps({
-                            "message": f"No collections found for carId {carId}."
-                        }))
-                    ])
-                )
-                return
-
-            newest_timestamp, newest_col = max(collections, key=lambda x: x[0])
-
-            results = []
-            legs = list(newest_col.stream())
-
-            results = []
-            for i, leg_doc in enumerate(legs):
-                leg = leg_doc.to_dict() or {}
-                entry = {
-                    "carId": carId,
-                    "from": leg.get("from", ""),
-                    "to": leg.get("to", ""),
-                    "distance": leg.get("distance", 0)
-                }
-                results.append(entry)
-
-            # --- Return all legs ---
-            ctx.session.state["temp:legs2"] = results        
-     
-        except Exception as e:
-            yield Event(
-                author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "error": f"Firestore error: {str(e)}"
-                    }))
-                ])
-            )
-
 
 Predictivecost_agent = LlmAgent(
     name="PredictivecostAgent",
@@ -240,17 +171,6 @@ Predictivecost_agent = LlmAgent(
     instruction=(
       """    Your job is to get user query from {temp:user_query} and calculate all requested with this data {temp:legs}.
         If {temp:legs} is empty or missing, say so clearly.
-        Output only the data in JSON or text form, nothing else.
-      """ 
-    )
-)
-
-Predictivecost_agent2 = LlmAgent(
-    name="PredictivecostAgent",
-    model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
-    instruction=(
-      """    Your job is to get user query from {temp:user_query2} and calculate all requested with this data {temp:legs2}.
-        If {temp:legs2} is empty or missing, say so clearly.
         Output only the data in JSON or text form, nothing else.
       """ 
     )
@@ -459,19 +379,11 @@ CalculatedElapseTimeReport_agent = LlmAgent(
 # Wrap BaseAgents as tools
 # -------------------------
 Predictivecost_agent_tool = agent_tool.AgentTool(agent=Predictivecost_agent)
-Predictivecost_agent2_tool = agent_tool.AgentTool(agent=Predictivecost_agent2)
 firestoredistanceanalytics_tool = agent_tool.AgentTool(agent=FirestoreDistanceAnalyticsAgent())
-firestoredistanceanalytics2_tool = agent_tool.AgentTool(agent=FirestoreDistanceAnalytics2Agent())
 firestorecalculatedtripcar_tool = agent_tool.AgentTool(agent=FirestoreCalculatedTripCarAgent())
 calculatedtripcarreport_tool = agent_tool.AgentTool(agent=CalculatedTripCarReport_agent)
 firestoreelapsedtime_tool = agent_tool.AgentTool(agent=FirestoreElapsedTimeAgent())
 calculatedelapsetime_tool = agent_tool.AgentTool(agent=CalculatedElapseTimeReport_agent)
-
-another_seq_agent = SequentialAgent(
-    name="anotherSequentialAgent",
-    sub_agents=[FirestoreDistanceAnalytics2Agent(), Predictivecost_agent2],
-    description="Run Firestore fetch first, then process with TestFetch agent using the same session temp."
-)
 
 
 combined_sequential_agent = SequentialAgent(
@@ -494,7 +406,6 @@ calculatedtripelapsetimeseq_agent = SequentialAgent(
 
 
 combined_sequential_agent_tool = agent_tool.AgentTool(agent=combined_sequential_agent)
-another_seq_agent_tool = agent_tool.AgentTool(agent=another_seq_agent)
 calculated_trip_carseq_tool = agent_tool.AgentTool(agent=calculatedtripcarseq_agent)
 calculated_elapse_timeseq_tool = agent_tool.AgentTool(agent=calculatedtripelapsetimeseq_agent)
 
@@ -503,7 +414,7 @@ semantic_agent = LlmAgent(
     name="SemanticAgent",
     model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
     instruction=DIRECTIONS_AGENT_INSTRUCTION,
-    tools=[combined_sequential_agent_tool, another_seq_agent_tool, calculated_trip_carseq_tool, calculated_elapse_timeseq_tool]   
+    tools=[combined_sequential_agent_tool, calculated_trip_carseq_tool, calculated_elapse_timeseq_tool]   
 )
 
 
