@@ -80,3 +80,4 @@ Leg documents: Contain from, to, and distance fields.
 
 Latest positions: cars_latest_position collection, structured with documents per trip and subcollections positions.
 
+![Workflow Diagram](ADKArchitechtureandflowdiagram.png)
