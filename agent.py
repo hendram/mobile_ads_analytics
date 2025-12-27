@@ -14,6 +14,7 @@ from collections import defaultdict
 from google.cloud import firestore
 from datetime import datetime
 import math
+import mysql.connector
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/agents/mobile_ads_analytics/serviceAccountKey.json"
 
@@ -84,158 +85,140 @@ executor = ThreadPoolExecutor(max_workers=2)
 
 import requests, os, json
 
-class FirestoreDistanceAnalyticsAgent(BaseAgent):
-    name: str = "FirestoreDistanceAnalyticsAgent"
+TIDB_HOST = os.getenv("TIDB_HOST")
+TIDB_USER = os.getenv("TIDB_USER")
+TIDB_PASS = os.getenv("TIDB_PASS")
+TIDB_DB = os.getenv("TIDB_DB_NAME", "test")
+TIDB_PORT = int(os.getenv("TIDB_PORT", 4000))
+TIDB_SSL_CA = os.getenv("TIDB_SSL_CA", "./ca.pem")
+
+def get_tidb_connection():
+    return mysql.connector.connect(
+        host=TIDB_HOST,
+        user=TIDB_USER,
+        password=TIDB_PASS,
+        database=TIDB_DB,
+        port=TIDB_PORT,
+        ssl_ca=TIDB_SSL_CA
+    )
+
+# -------------------------
+# BaseAgents (specialized agents)
+# -------------------------
+class TiDBDistanceAnalyticsAgent(BaseAgent):
+    name: str = "TiDBDistanceAnalyticsAgent"
     description: str = (
-        "For the given carId, find the newest collection <carId>_coll_* "
-        "and return all legs with their from, to, and distance."
+        "For the given carId, find the latest trip collection "
+        "and return all legs with from, to, distance."
     )
    
     async def _run_async_impl(self, ctx):
-        db = firestore.Client()
-
-        raw = None
-        if hasattr(ctx, "user_content") and ctx.user_content.parts:
-            raw = ctx.user_content.parts[0].text.strip()
- 
+        raw = getattr(ctx.user_content.parts[0], "text", "").strip()
         if not raw:
             yield Event(
                 author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "error": "JSON input required: {carId}"
-                    }))
-                ])
+                content=types.Content(parts=[types.Part(text=json.dumps({"error": "JSON input required: {carId}"}))])
             )
             return
         
-        raw_json = json.loads(raw)  
-        carId = raw_json.get("id")
-        user_query = raw_json.get("userquery")
-        ctx.session.state["temp:user_query"] = user_query        
-        try:
-            collections = []
-            for col in db.collections():
-                cname = col.id
-                if cname.startswith(f"{carId}_coll_"):
-                    try:
-                        _, timestamp = cname.split("_coll_", 1)
-                        collections.append((timestamp, col))
-                    except ValueError:
-                        continue
+        payload = json.loads(raw)
+        carId = payload.get("id")
+        user_query = payload.get("userquery")
+        ctx.session.state["temp:user_query"] = user_query
+        conn = None
+        cursor = None
 
-            if not collections:
-                yield Event(
-                    author=self.name,
-                    content=types.Content(parts=[
-                        types.Part(text=json.dumps({
-                            "message": f"No collections found for carId {carId}."
-                        }))
-                    ])
-                )
+        try:
+            conn = get_tidb_connection()
+            cursor = conn.cursor(dictionary=True)
+
+            # Latest trip collection
+            cursor.execute("""
+                SELECT DISTINCT trip_collection 
+                FROM car_trip_legs 
+                WHERE car_id=%s 
+                ORDER BY trip_collection DESC LIMIT 1
+            """, (carId,))
+            row = cursor.fetchone()
+            if not row:
+                ctx.session.state["temp:legs"] = []
                 return
 
-            newest_timestamp, newest_col = max(collections, key=lambda x: x[0])
+            latest_trip = row["trip_collection"]
 
-            results = []
-            legs = list(newest_col.stream())
+            cursor.execute("""
+                SELECT leg_index, origin, destination, distance_m 
+                FROM car_trip_legs 
+                WHERE car_id=%s AND trip_collection=%s 
+                ORDER BY leg_index ASC
+            """, (carId, latest_trip))
 
-            results = []
-            for i, leg_doc in enumerate(legs):
-                leg = leg_doc.to_dict() or {}
-                entry = {
-                    "carId": carId,
-                    "from": leg.get("from", ""),
-                    "to": leg.get("to", ""),
-                    "distance": leg.get("distance", 0)
-                }
-                results.append(entry)
+            legs = cursor.fetchall()
+            results = [{"carId": carId, "from": leg["origin"], "to": leg["destination"], "distance": leg["distance_m"]} for leg in legs]
 
-            # --- Return all legs ---
-            ctx.session.state["temp:legs"] = results        
-     
+            ctx.session.state["temp:legs"] = results
+            logger.info("SESSION STATE DUMP: %s", json.dumps(ctx.session.state, default=str))
+
         except Exception as e:
-            yield Event(
-                author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "error": f"Firestore error: {str(e)}"
-                    }))
-                ])
-            )
+            ctx.session.state["temp:legs"] = {"error": str(e)}
+        finally:
+            if cursor is not None:
+               cursor.close()
+            if conn is not None:
+               conn.close()
 
 
 Predictivecost_agent = LlmAgent(
     name="PredictivecostAgent",
     model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
     instruction=(
-      """    Your job is to get user query from {temp:user_query} and calculate all requested with this data {temp:legs}.
+      """    Your job is to get user query from {temp:user_query} and calculate all requested with this data {temp:legs} ,
+        don't drop any single leg and calculate step by step from leg 1 till finished using formula cost/km * total legs,
+        which you need to add all distance first from leg 1 till last leg, and adapt it or convert it based on user input,
+        like if cost/m or cost/feet, then convert to adjust it.
         If {temp:legs} is empty or missing, say so clearly.
         Output only the data in JSON or text form, nothing else.
       """ 
     )
 )
 
-class FirestoreCalculatedTripCarAgent(BaseAgent):
-    name: str = "FirestoreCalculatedTripCarAgent"
-    description: str = (
-        "For the given carId, count how many collections <carId>_coll_* exist "
-        "to see how many times the car drove that route."
-    )
-   
+class TiDBCalculatedTripCarAgent(BaseAgent):
+    name: str = "TiDBCalculatedTripCarAgent"
+    description: str = "Count how many trips a specific car has driven."
+
     async def _run_async_impl(self, ctx):
-        db = firestore.Client()
-
-        # --- Get input string (carId) ---
-        raw = None
-        if hasattr(ctx, "user_content") and ctx.user_content.parts:
-            raw = ctx.user_content.parts[0].text.strip()
- 
+        raw = getattr(ctx.user_content.parts[0], "text", "").strip()
+        conn = None
+        cursor = None
         if not raw:
-            yield Event(
-                author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "error": "JSON input required: {carId}"
-                    }))
-                ])
-            )
+            ctx.session.state["temp:num_drives"] = {"error": "JSON input required: {carId}"}
             return
-        
+
+        payload = json.loads(raw)
+        carId = payload.get("id")
+        if not carId:
+            ctx.session.state["temp:num_drives"] = {"error": "Missing 'id' in input JSON."}
+            return
+
         try:
-            raw_json = json.loads(raw)
-            carId = raw_json.get("id")
-            if not carId:
-                yield Event(
-                    author=self.name,
-                    content=types.Content(parts=[
-                        types.Part(text=json.dumps({
-                            "error": "Missing 'id' in input JSON."
-                        }))
-                    ])
-                )
-                return
-
-            # --- Find all collections that match this carId ---
-            num_drives = sum(1 for col in db.collections() if col.id.startswith(f"{carId}_coll_"))
-            # --- Prepare and yield response ---
-            response = {
-                "carId": carId,
-                "num_drives": num_drives
-            }
-
-            # --- Store in session ---
-            ctx.session.state[f"temp:num_drives"] = response
+            conn = get_tidb_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(DISTINCT trip_collection) AS num_drives
+                FROM car_trip_legs
+                WHERE car_id=%s
+            """, (carId,))
+            row = cursor.fetchone()
+            ctx.session.state["temp:num_drives"] = {"carId": carId, "num_drives": row[0] if row else 0}
+            logger.info("SESSION STATE DUMP: %s", json.dumps(ctx.session.state, default=str))
 
         except Exception as e:
-            yield Event(
-                author=self.name,
-                content=types.Content(parts=[
-                    types.Part(text=json.dumps({
-                        "error": f"Firestore error: {str(e)}"
-                    }))
-                ])
-            )
+            ctx.session.state["temp:num_drives"] = {"error": str(e)}
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
 
 CalculatedTripCarReport_agent = LlmAgent(
     name="CalculatedTripCarReportAgent",
@@ -272,94 +255,50 @@ def parse_firestore_ts(ts_str: str) -> datetime:
     raise ValueError(f"Invalid Firestore timestamp format: {ts_str}")
 
 
-class FirestoreElapsedTimeAgent(BaseAgent):
-    name: str = "FirestoreElapsedTimeAgent"
-    description: str = (
-        "For a given carId, calculate how many hours, minutes, and seconds "
-        "have elapsed since the first drive until the latest drive."
-    )
-
+class TiDBElapsedTimeAgent(BaseAgent):
+    name: str = "TiDBElapsedTimeAgent"
+    description: str = "Calculate elapsed time for latest trip of a car."
+   
     async def _run_async_impl(self, ctx):
-        db = firestore.Client()
-
-        # --- Parse JSON input ---
-        raw = None
-        if hasattr(ctx, "user_content") and ctx.user_content.parts:
-            raw = ctx.user_content.parts[0].text
-
+        raw = getattr(ctx.user_content.parts[0], "text", "").strip()
+        conn = None
+        cursor = None   
         if not raw:
-             yield Event(
-                 author=self.name,
-                 content=types.Content(parts=[
-                 types.Part(text=json.dumps({"error": "JSON input required: {carId}"}))
-                 ])
-             )
-             return
+            ctx.session.state["temp:elapsed_time"] = {"error": "JSON input required: {carId}"}
+            return
 
-        try:
-            payload = json.loads(raw)
-            carId_input = payload.get("id", "").strip()
-            if not carId_input:
-                raise ValueError("carId is required")
-        except Exception as e:
-            ctx.session.state["temp:elapsed_time"] = {
-                "error": f"Invalid JSON or missing fields: {str(e)}"
-            }
+        payload = json.loads(raw)
+        carId = payload.get("id")
+        if not carId:
+            ctx.session.state["temp:elapsed_time"] = {"error": "Missing 'id' in input JSON."}
             return
 
         try:
-            all_docs = []
-            for doc in db.collection("cars_latest_position").stream():
-                doc_id = doc.id
-                if doc_id.startswith(f"{carId_input}_"):
-                    try:
-                        _, timestamp_str = doc_id.split("_", 1)
-                        all_docs.append((timestamp_str, doc))
-                    except ValueError:
-                        continue
-
-            if not all_docs:
-                ctx.session.state["temp:elapsed_time"] = {
-                    "error": f"No documents found for carId {carId_input}"
-                }
+            conn = get_tidb_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts
+                FROM car_latest_positions
+                WHERE car_id=%s
+            """, (carId,))
+            row = cursor.fetchone()
+            if not row or not row["first_ts"] or not row["last_ts"]:
+                ctx.session.state["temp:elapsed_time"] = {"error": "No positions found"}
                 return
 
-            all_docs.sort(key=lambda x: x[0])
-            latest_timestamp_str, latest_doc = all_docs[-1] 
-
-            latest_dt = parse_firestore_ts(latest_timestamp_str)
-            positions_coll = latest_doc.reference.collection("positions")
-            latest_position_ts = None
-            for pos_doc in positions_coll.stream():
-                pos = pos_doc.to_dict() or {}
-                ts_str = pos.get("timestamp")  
-                if ts_str:
-                    pos_dt = parse_firestore_ts(ts_str)
-                    if not latest_position_ts or pos_dt > latest_position_ts:
-                        latest_position_ts = pos_dt
-            if not latest_position_ts:
-                latest_position_ts = latest_dt
-
-            elapsed = latest_position_ts - latest_dt
-            hours, remainder = divmod(elapsed.total_seconds(), 3600)
-            minutes, seconds = divmod(remainder, 60)
-
-            # --- Store in session ---
-            ctx.session.state["temp:elapsed_time"] = {
-                "carId": carId_input,
-                "elapsed_time": {
-                    "hours": int(hours),
-                    "minutes": int(minutes),
-                    "seconds": int(seconds)
-                }
-            }
+            elapsed = row["last_ts"] - row["first_ts"]
+            hours, rem = divmod(elapsed.total_seconds(), 3600)
+            minutes, seconds = divmod(rem, 60)
+            ctx.session.state["temp:elapsed_time"] = {"carId": carId, "elapsed_time": {"hours": int(hours), "minutes": int(minutes), "seconds": int(seconds)}}
+            logger.info("SESSION STATE DUMP: %s", json.dumps(ctx.session.state, default=str))
 
         except Exception as e:
-            ctx.session.state["temp:elapsed_time"] = {
-                "error": f"Firestore error: {str(e)}"
-            }
-            return
-
+            ctx.session.state["temp:elapsed_time"] = {"error": str(e)}
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
 
 CalculatedElapseTimeReport_agent = LlmAgent(
     name="CalculatedElapseTimeReportAgent",
@@ -379,29 +318,29 @@ CalculatedElapseTimeReport_agent = LlmAgent(
 # Wrap BaseAgents as tools
 # -------------------------
 Predictivecost_agent_tool = agent_tool.AgentTool(agent=Predictivecost_agent)
-firestoredistanceanalytics_tool = agent_tool.AgentTool(agent=FirestoreDistanceAnalyticsAgent())
-firestorecalculatedtripcar_tool = agent_tool.AgentTool(agent=FirestoreCalculatedTripCarAgent())
+tidbdistanceanalytics_tool = agent_tool.AgentTool(agent=TiDBDistanceAnalyticsAgent())
+tidbcalculatedtripcar_tool = agent_tool.AgentTool(agent=TiDBCalculatedTripCarAgent())
 calculatedtripcarreport_tool = agent_tool.AgentTool(agent=CalculatedTripCarReport_agent)
-firestoreelapsedtime_tool = agent_tool.AgentTool(agent=FirestoreElapsedTimeAgent())
+tidbelapsedtime_tool = agent_tool.AgentTool(agent=TiDBElapsedTimeAgent())
 calculatedelapsetime_tool = agent_tool.AgentTool(agent=CalculatedElapseTimeReport_agent)
 
 
 combined_sequential_agent = SequentialAgent(
     name="combinedSequentialAgent",
-    sub_agents=[FirestoreDistanceAnalyticsAgent(), Predictivecost_agent],
-    description="Run Firestore fetch first, then process with TestFetch agent using the same session temp."
+    sub_agents=[TiDBDistanceAnalyticsAgent(), Predictivecost_agent],
+    description="Run TiDB fetch first, then process with TestFetch agent using the same session temp."
 )
 
 calculatedtripcarseq_agent = SequentialAgent(
     name="calculatedtripcarSequentialAgent",
-    sub_agents=[FirestoreCalculatedTripCarAgent(), CalculatedTripCarReport_agent],
-    description="Run FirestoreCalculatedTripCar first, then process with CalculatedTripCarReport agent using the same session temp."
+    sub_agents=[TiDBCalculatedTripCarAgent(), CalculatedTripCarReport_agent],
+    description="Run TiDBCalculatedTripCar first, then process with CalculatedTripCarReport agent using the same session temp."
 )
 
 calculatedtripelapsetimeseq_agent = SequentialAgent(
     name="calculatedtripelapsetimeSequentialAgent",
-    sub_agents=[FirestoreElapsedTimeAgent(), CalculatedElapseTimeReport_agent],
-    description="Run FirestoreElapseTime first, then process with CalculatedElapseTimeReport agent using the same session temp."
+    sub_agents=[TiDBElapsedTimeAgent(), CalculatedElapseTimeReport_agent],
+    description="Run TiDBElapseTime first, then process with CalculatedElapseTimeReport agent using the same session temp."
 )
 
 
