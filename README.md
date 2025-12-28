@@ -27,6 +27,7 @@ Install dependencies:
 ```bash
 pip install google-cloud-firestore google-adk google-genai requests
 
+/home# source .venv/bin/activate
 /home# adk api_server agents
 ```
 
