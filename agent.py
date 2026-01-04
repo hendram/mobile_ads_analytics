@@ -50,11 +50,13 @@ Rules:
      without markdown ```html or ```json, anything markdown and don't skip any single leg, 
      comparing with car 1 if cost of fuel for car 1 per 2000 meters will cost 3 usd and make table too with 
      table distance, from, to, cost and calculate different total cost between car 1 and car 2, which one more expensive for total route 
-     then you can run tools combined_sequential_agent and run it combined_sequential_agent again for another car 
-     and intelligently divide user asked for combined_sequential_agent and second call combined_sequential_agent
+     then you can run tools combined_sequential_agent and run combinedsecond_sequential_agent after combined_sequential_agent 
+     for another car (important here that another car must use combinedsecond_sequential_agent, not same
+     combined_sequential_agent ) 
+     and intelligently divide user asked for combined_sequential_agent and  combinedsecond_sequential_agent
      based on carId  and    
     make it like json { id: carId, userquery: user asked match with carId}  and input it to combined_sequential_agent,
-           { id: carId, userquery: user asked match with carId } input it again to combined_sequential_agent 
+           { id: carId, userquery: user asked match with carId } input it again for another car to combinedsecond_sequential_agent 
     which each id different car id and different user asked
 
 4. Scenario 4: Counting how many trip specific car has drove in
@@ -188,6 +190,89 @@ Predictivecost_agent = LlmAgent(
     )
 )
 
+class TiDBDistanceAnalyticssecondAgent(BaseAgent):
+    name: str = "TiDBDistanceAnalyticssecondAgent"
+    description: str = (
+        "For the given carId, find the latest trip collection "
+        "and return all legs with from, to, distance."
+    )
+   
+    async def _run_async_impl(self, ctx):
+        raw = getattr(ctx.user_content.parts[0], "text", "").strip()
+        if not raw:
+            yield Event(
+                author=self.name,
+                content=types.Content(parts=[types.Part(text=json.dumps({"error": "JSON input required: {carId}"}))])
+            )
+            return
+        
+        payload = json.loads(raw)
+        carId = payload.get("id")
+        user_query = payload.get("userquery")
+        ctx.session.state["temp:user_querysecond"] = user_query
+        conn = None
+        cursor = None
+
+        try:
+            conn = get_tidb_connection()
+            cursor = conn.cursor(dictionary=True)
+
+            # Latest trip collection
+            cursor.execute("""
+                SELECT DISTINCT trip_collection 
+                FROM car_trip_legs 
+                WHERE car_id=%s 
+                ORDER BY trip_collection DESC LIMIT 1
+            """, (carId,))
+            row = cursor.fetchone()
+            if not row:
+                ctx.session.state["temp:legssecond"] = []
+                return
+
+            latest_trip = row["trip_collection"]
+
+            cursor.execute("""
+                SELECT leg_index, origin, destination, distance_m 
+                FROM car_trip_legs 
+                WHERE car_id=%s AND trip_collection=%s 
+                ORDER BY leg_index ASC
+            """, (carId, latest_trip))
+
+            legs = cursor.fetchall()
+            results = [{"carId": carId, "leg_index": leg["leg_index"], "from": leg["origin"], "to": leg["destination"], "distance": leg["distance_m"]} for leg in legs]
+
+            ctx.session.state["temp:legssecond"] = results
+            logger.info("SESSION STATE DUMP: %s", json.dumps(ctx.session.state, default=str))
+
+        except Exception as e:
+            ctx.session.state["temp:legssecond"] = {"error": str(e)}
+        finally:
+            if cursor is not None:
+               cursor.close()
+            if conn is not None:
+               conn.close()
+
+
+Predictivecostsecond_agent = LlmAgent(
+    name="PredictivecostsecondAgent",
+    model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
+    instruction=(
+        """ 
+          Your job is to get user query from {temp:user_querysecond} and calculate all requested with this data {temp:legssecond} ,
+          don't drop any single leg and calculate step by step from leg_index 1 till last number leg_index finished 
+          using formula (cost/km * total legs distance),
+          which you need to add all distance step by step first from leg_index 1 till last number leg_index
+          to get total legs distance, 
+          and adapt it or convert it based on user input,
+          like if cost/m or cost/feet, then convert to adjust it before using formula (cost/km * total legs distance).
+          If {temp:legssecond} is empty or missing, say so clearly.
+          Output only the data in JSON or text form as asked in  user query, explain it how you calculate total cost 
+          step by step, if for example total distance not asked, then no need to output it.
+        """ 
+         )
+)
+
+
 class TiDBCalculatedTripCarAgent(BaseAgent):
     name: str = "TiDBCalculatedTripCarAgent"
     description: str = "Count how many trips a specific car has driven."
@@ -203,6 +288,7 @@ class TiDBCalculatedTripCarAgent(BaseAgent):
                content=types.Content(parts=[types.Part(text=json.dumps({"error": "JSON input required: {carId}"}))])
             )
             return
+ 
         payload = json.loads(raw)
         carId = payload.get("id")
         if not carId:
@@ -326,19 +412,35 @@ CalculatedElapseTimeReport_agent = LlmAgent(
 # -------------------------
 # Wrap BaseAgents as tools
 # -------------------------
+
 Predictivecost_agent_tool = agent_tool.AgentTool(agent=Predictivecost_agent)
 tidbdistanceanalytics_tool = agent_tool.AgentTool(agent=TiDBDistanceAnalyticsAgent())
+Predictivecostsecond_agent_tool = agent_tool.AgentTool(agent=Predictivecostsecond_agent)
+tidbdistanceanalyticssecond_tool = agent_tool.AgentTool(agent=TiDBDistanceAnalyticssecondAgent())
 tidbcalculatedtripcar_tool = agent_tool.AgentTool(agent=TiDBCalculatedTripCarAgent())
 calculatedtripcarreport_tool = agent_tool.AgentTool(agent=CalculatedTripCarReport_agent)
 tidbelapsedtime_tool = agent_tool.AgentTool(agent=TiDBElapsedTimeAgent())
 calculatedelapsetime_tool = agent_tool.AgentTool(agent=CalculatedElapseTimeReport_agent)
 
-
 combined_sequential_agent = SequentialAgent(
     name="combinedSequentialAgent",
-    sub_agents=[TiDBDistanceAnalyticsAgent(), Predictivecost_agent],
-    description="Run TiDB fetch first, then process with TestFetch agent using the same session temp. Run it once then finish"
+    sub_agents=[
+        TiDBDistanceAnalyticsAgent(),
+        Predictivecost_agent
+    ],
+    description="Tidbdistanceanalyticsagent first then predictivecostagent run"
 )
+
+
+combinedsecond_sequential_agent = SequentialAgent(
+    name="combinedsecondSequentialAgent",
+    sub_agents=[
+        TiDBDistanceAnalyticssecondAgent(),
+        Predictivecostsecond_agent
+    ],
+    description="Tidbdistanceanalyticssecondagent first then predictivecostsecondagent run"
+)
+
 
 calculatedtripcarseq_agent = SequentialAgent(
     name="calculatedtripcarSequentialAgent",
@@ -354,6 +456,7 @@ calculatedtripelapsetimeseq_agent = SequentialAgent(
 
 
 combined_sequential_agent_tool = agent_tool.AgentTool(agent=combined_sequential_agent)
+combinedsecond_sequential_agent_tool = agent_tool.AgentTool(agent=combinedsecond_sequential_agent)
 calculated_trip_carseq_tool = agent_tool.AgentTool(agent=calculatedtripcarseq_agent)
 calculated_elapse_timeseq_tool = agent_tool.AgentTool(agent=calculatedtripelapsetimeseq_agent)
 
@@ -362,8 +465,58 @@ semantic_agent = LlmAgent(
     name="SemanticAgent",
     model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
     instruction=DIRECTIONS_AGENT_INSTRUCTION,
-    tools=[combined_sequential_agent_tool, calculated_trip_carseq_tool, calculated_elapse_timeseq_tool]   
+    tools=[combined_sequential_agent_tool, combinedsecond_sequential_agent_tool, calculated_trip_carseq_tool, calculated_elapse_timeseq_tool]   
 )
+
+original_semantic_run = semantic_agent._run_async_impl
+
+async def debug_semantic_run(ctx):
+    print("\n=== SemanticAgent DEBUG ===")
+    print("Input context passed from RootAgent:")
+    print(ctx)
+
+    # This preserves async generator behavior expected by ADK
+    async for event in original_semantic_run(ctx):
+        # --- Inspect raw event ---
+        print("Event:", event)
+
+        # --- If event contains LLM response, inspect it ---
+        llm_response = getattr(event, "llm_response", None)
+        if llm_response:
+            for i, candidate in enumerate(llm_response.candidates):
+                for j, part in enumerate(candidate.content.parts):
+                    part_type = getattr(part, "type", "<unknown>")
+                    part_text = getattr(part, "text", "")
+                    part_metadata = getattr(part, "metadata", None)
+                    print(f"[Candidate {i} Part {j}] Type: {part_type}")
+                    print(f"Text: {part_text}")
+                    print(f"Metadata: {part_metadata}")
+
+            # Concatenate output_text parts
+            llm_text = ""
+            for candidate in llm_response.candidates:
+                for part in candidate.content.parts:
+                    if getattr(part, "type", "") == "output_text" and getattr(part, "text", ""):
+                        llm_text += part.text
+
+            print("\n=== Concatenated output_text ===")
+            print(llm_text)
+
+            # Try parsing as JSON
+            try:
+                parsed_json = json.loads(llm_text)
+                print("\n✅ Parsed JSON from SemanticAgent output:")
+                print(json.dumps(parsed_json, indent=2))
+            except json.JSONDecodeError:
+                print("\n⚠️ Could not parse as JSON. Raw text returned instead.")
+
+        # Yield the event to preserve async generator interface
+        yield event
+
+# Patch the agent
+semantic_agent._run_async_impl = debug_semantic_run
+
+
 
 # -------------------------
 # LLM Agent: Root / Coordinator
