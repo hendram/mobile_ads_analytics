@@ -45,7 +45,9 @@ Rules:
    carId without spaces (e.g., car1) and user ask, so make it like json { id: carId, userquery: user asks }.
 
 3. Scenario 3: Comparing total cost of fuel or driver between 2 car
-   - If user ask something like "please calculate total cost of fuel if per 1000 meters will cost 2usd for car 2 and return all waypoint too with table distance, from, to, cost  and 
+   - If user ask something like "please calculate total cost of fuel if per 1000 meters will cost 2usd for car 2 and return all waypoint too with table distance, from, to, cost 
+     in form of html table like <table><td><tr>...</td></tr></table> for number of tr and td adjusted based on result and 
+     without markdown ```html or ```json, anything markdown and don't skip any single leg, 
      comparing with car 1 if cost of fuel for car 1 per 2000 meters will cost 3 usd and make table too with 
      table distance, from, to, cost and calculate different total cost between car 1 and car 2, which one more expensive for total route 
      then you can run tools combined_sequential_agent and run it combined_sequential_agent again for another car 
@@ -154,7 +156,7 @@ class TiDBDistanceAnalyticsAgent(BaseAgent):
             """, (carId, latest_trip))
 
             legs = cursor.fetchall()
-            results = [{"carId": carId, "from": leg["origin"], "to": leg["destination"], "distance": leg["distance_m"]} for leg in legs]
+            results = [{"carId": carId, "leg_index": leg["leg_index"], "from": leg["origin"], "to": leg["destination"], "distance": leg["distance_m"]} for leg in legs]
 
             ctx.session.state["temp:legs"] = results
             logger.info("SESSION STATE DUMP: %s", json.dumps(ctx.session.state, default=str))
@@ -173,11 +175,15 @@ Predictivecost_agent = LlmAgent(
     model=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
     instruction=(
       """    Your job is to get user query from {temp:user_query} and calculate all requested with this data {temp:legs} ,
-        don't drop any single leg and calculate step by step from leg 1 till finished using formula cost/km * total legs,
-        which you need to add all distance first from leg 1 till last leg, and adapt it or convert it based on user input,
-        like if cost/m or cost/feet, then convert to adjust it.
+        don't drop any single leg and calculate step by step from leg_index 1 till last number leg_index finished 
+        using formula (cost/km * total legs distance),
+        which you need to add all distance step by step first from leg_index 1 till last number leg_index
+         to get total legs distance, 
+        and adapt it or convert it based on user input,
+        like if cost/m or cost/feet, then convert to adjust it before using formula (cost/km * total legs distance).
         If {temp:legs} is empty or missing, say so clearly.
-        Output only the data in JSON or text form, nothing else.
+        Output only the data in JSON or text form as asked in  user query, no need to give more, if for example total distance
+        not asked, then no need to output it.
       """ 
     )
 )
@@ -192,8 +198,11 @@ class TiDBCalculatedTripCarAgent(BaseAgent):
         cursor = None
         if not raw:
             ctx.session.state["temp:num_drives"] = {"error": "JSON input required: {carId}"}
+            yield Event(
+               author=self.name,
+               content=types.Content(parts=[types.Part(text=json.dumps({"error": "JSON input required: {carId}"}))])
+            )
             return
-
         payload = json.loads(raw)
         carId = payload.get("id")
         if not carId:
@@ -204,8 +213,8 @@ class TiDBCalculatedTripCarAgent(BaseAgent):
             conn = get_tidb_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT COUNT(DISTINCT trip_collection) AS num_drives
-                FROM car_trip_legs
+                SELECT COUNT(DISTINCT trip_doc) AS num_drives
+                FROM car_latest_positions
                 WHERE car_id=%s
             """, (carId,))
             row = cursor.fetchone()
@@ -328,7 +337,7 @@ calculatedelapsetime_tool = agent_tool.AgentTool(agent=CalculatedElapseTimeRepor
 combined_sequential_agent = SequentialAgent(
     name="combinedSequentialAgent",
     sub_agents=[TiDBDistanceAnalyticsAgent(), Predictivecost_agent],
-    description="Run TiDB fetch first, then process with TestFetch agent using the same session temp."
+    description="Run TiDB fetch first, then process with TestFetch agent using the same session temp. Run it once then finish"
 )
 
 calculatedtripcarseq_agent = SequentialAgent(
@@ -355,7 +364,6 @@ semantic_agent = LlmAgent(
     instruction=DIRECTIONS_AGENT_INSTRUCTION,
     tools=[combined_sequential_agent_tool, calculated_trip_carseq_tool, calculated_elapse_timeseq_tool]   
 )
-
 
 # -------------------------
 # LLM Agent: Root / Coordinator
