@@ -81,3 +81,14 @@ Leg documents: Contain from, to, and distance fields.
 Latest positions: cars_latest_position collection, structured with documents per trip and subcollections positions.
 
 ![Workflow Diagram](ADKArchitechtureandflowdiagram.png)
+
+### Dockerfile
+FROM ghcr.io/hendram/adk:latest
+
+WORKDIR /home
+
+ENV PORT=8080
+
+EXPOSE 8080
+
+CMD ["/home/.venv/bin/adk", "api_server", "agents", "--host", "0.0.0.0", "--port", "8080"]
